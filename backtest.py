@@ -21,9 +21,14 @@ STOCKS = {
     "TSLA":   ("Tesla",  "US"),
 }
 
-INITIAL_CASH    = 100_000
-MAX_POS_RATIO   = 0.20
-BACKTEST_PERIOD = "2y"
+INITIAL_CASH       = 100_000
+MAX_POS_RATIO      = 0.20
+STOP_LOSS_RATIO    = 0.08   # 損切りライン -8%（通常変動を許容）
+TAKE_PROFIT_RATIO  = 0.20   # 利確ライン  +20%
+RSI_BUY_MAX        = 60     # RSIフィルター（より厳格）
+MA_SHORT           = 20     # 短期MA（5→20に変更）
+MA_LONG            = 60     # 長期MA（20→60に変更）
+BACKTEST_PERIOD    = "3y"   # 3年に拡張
 OUTPUT_CSV      = os.path.join(os.path.dirname(__file__), "backtest_results.csv")
 SUMMARY_CSV     = os.path.join(os.path.dirname(__file__), "backtest_summary.csv")
 
@@ -53,18 +58,31 @@ def calc_rakuten_fee(amount: float, market: str) -> float:
         return max(33.0, min(amount * 0.00495, 3_300.0))
 
 
+def calc_rsi(prices: pd.Series, period: int = 14):
+    """RSI(14)の直近値を返す"""
+    if len(prices) < period + 1:
+        return None
+    delta = prices.diff()
+    gain  = delta.clip(lower=0).rolling(period).mean()
+    loss  = (-delta.clip(upper=0)).rolling(period).mean()
+    rs    = gain / loss.replace(0, float('nan'))
+    rsi   = 100 - (100 / (1 + rs))
+    return round(float(rsi.iloc[-1]), 1)
+
+
 def calc_signal(prices: pd.Series):
-    if len(prices) < 21:
+    need = MA_LONG + 1
+    if len(prices) < need:
         return "HOLD", None, None
-    ma5  = prices.rolling(5).mean()
-    ma20 = prices.rolling(20).mean()
-    prev_diff = float(ma5.iloc[-2]) - float(ma20.iloc[-2])
-    curr_diff = float(ma5.iloc[-1]) - float(ma20.iloc[-1])
+    ma_s = prices.rolling(MA_SHORT).mean()
+    ma_l = prices.rolling(MA_LONG).mean()
+    prev_diff = float(ma_s.iloc[-2]) - float(ma_l.iloc[-2])
+    curr_diff = float(ma_s.iloc[-1]) - float(ma_l.iloc[-1])
     if prev_diff < 0 and curr_diff >= 0:
-        return "BUY",  round(float(ma5.iloc[-1]), 2), round(float(ma20.iloc[-1]), 2)
+        return "BUY",  round(float(ma_s.iloc[-1]), 2), round(float(ma_l.iloc[-1]), 2)
     if prev_diff > 0 and curr_diff <= 0:
-        return "SELL", round(float(ma5.iloc[-1]), 2), round(float(ma20.iloc[-1]), 2)
-    return "HOLD", round(float(ma5.iloc[-1]), 2), round(float(ma20.iloc[-1]), 2)
+        return "SELL", round(float(ma_s.iloc[-1]), 2), round(float(ma_l.iloc[-1]), 2)
+    return "HOLD", round(float(ma_s.iloc[-1]), 2), round(float(ma_l.iloc[-1]), 2)
 
 
 def run_backtest():
@@ -106,12 +124,27 @@ def run_backtest():
                 continue
 
             signal, ma5, ma20 = calc_signal(hist)
+            rsi           = calc_rsi(hist)
             current_price = float(hist.iloc[-1])
             pos           = positions.get(ticker)
             shares_held   = pos["shares"]    if pos else 0.0
             avg_price_pos = pos["avg_price"] if pos else 0.0
 
+            # 保有中: 損切り・利確チェック（MAシグナルより優先）
+            sell_reason = None
+            if shares_held > 0:
+                change_pct = (current_price - avg_price_pos) / avg_price_pos
+                if change_pct <= -STOP_LOSS_RATIO:
+                    signal      = "SELL"
+                    sell_reason = f"損切り {change_pct*100:+.1f}%"
+                elif change_pct >= TAKE_PROFIT_RATIO:
+                    signal      = "SELL"
+                    sell_reason = f"利確 {change_pct*100:+.1f}%"
+
             if signal == "BUY" and shares_held == 0:
+                # RSIフィルター
+                if rsi is not None and rsi > RSI_BUY_MAX:
+                    continue
                 budget = cash * MAX_POS_RATIO
                 if budget < current_price:
                     continue
@@ -128,7 +161,8 @@ def run_backtest():
                     "action": "BUY", "shares": shares_to_buy,
                     "price": current_price, "total": cost,
                     "fee": round(fee, 2), "profit": None,
-                    "ma5": ma5, "ma20": ma20,
+                    "ma5": ma5, "ma20": ma20, "rsi": rsi,
+                    "reason": f"ゴールデンクロス RSI={rsi}",
                 })
 
             elif signal == "SELL" and shares_held > 0:
@@ -143,7 +177,8 @@ def run_backtest():
                     "action": "SELL", "shares": shares_held,
                     "price": current_price, "total": proceeds,
                     "fee": round(fee, 2), "profit": round(profit, 2),
-                    "ma5": ma5, "ma20": ma20,
+                    "ma5": ma5, "ma20": ma20, "rsi": rsi,
+                    "reason": sell_reason or "デッドクロス",
                 })
 
         # 日次評価額

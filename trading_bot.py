@@ -25,8 +25,13 @@ STOCKS = {
     "TSLA":   ("Tesla",  "US"),
 }
 
-INITIAL_CASH = 100_000  # 仮想元金（円）
-MAX_POSITION_RATIO = 0.2  # 1銘柄に使う資金の最大割合
+INITIAL_CASH       = 100_000  # 仮想元金（円）
+MAX_POSITION_RATIO = 0.2      # 1銘柄に使う資金の最大割合
+STOP_LOSS_RATIO    = 0.08     # 損切りライン: 取得価格から-8%
+TAKE_PROFIT_RATIO  = 0.20     # 利確ライン:   取得価格から+20%
+RSI_BUY_MAX        = 60       # RSIがこれ以上の時は買わない（過熱域を避ける）
+MA_SHORT           = 20       # 短期MA
+MA_LONG            = 60       # 長期MA
 
 # 楽天証券 超割コース 日本株手数料テーブル（税込）
 _JP_FEE = [
@@ -126,31 +131,42 @@ def set_position(conn, ticker, shares, avg_price):
         )
 
 
-def get_price_history(ticker, period="60d"):
+def get_price_history(ticker, period="120d"):
     try:
         df = yf.download(ticker, period=period, auto_adjust=True, progress=False)
         if df.empty:
             return None
-        return df["Close"].squeeze()
+        return df["Close"].squeeze().dropna()
     except Exception as e:
         print(f"  価格取得エラー {ticker}: {e}")
         return None
 
 
+def calc_rsi(prices, period=14):
+    """RSI(14)を計算して直近値を返す"""
+    if len(prices) < period + 1:
+        return None
+    delta    = prices.diff()
+    gain     = delta.clip(lower=0).rolling(period).mean()
+    loss     = (-delta.clip(upper=0)).rolling(period).mean()
+    rs       = gain / loss.replace(0, float('nan'))
+    rsi      = 100 - (100 / (1 + rs))
+    return round(float(rsi.iloc[-1]), 1)
+
+
 def calc_signal(prices):
-    """MA5がMA20を上抜け→BUY、下抜け→SELL、それ以外→HOLD"""
-    if len(prices) < 21:
+    """MA_SHORTがMA_LONGを上抜け→BUY、下抜け→SELL、それ以外→HOLD"""
+    if len(prices) < MA_LONG + 1:
         return "HOLD", None, None
-    ma5  = prices.rolling(5).mean()
-    ma20 = prices.rolling(20).mean()
-    # 直近2日のクロス判定
-    prev_diff = ma5.iloc[-2] - ma20.iloc[-2]
-    curr_diff = ma5.iloc[-1] - ma20.iloc[-1]
+    ma_s = prices.rolling(MA_SHORT).mean()
+    ma_l = prices.rolling(MA_LONG).mean()
+    prev_diff = ma_s.iloc[-2] - ma_l.iloc[-2]
+    curr_diff = ma_s.iloc[-1] - ma_l.iloc[-1]
     if prev_diff < 0 and curr_diff >= 0:
-        return "BUY",  round(float(ma5.iloc[-1]), 2), round(float(ma20.iloc[-1]), 2)
+        return "BUY",  round(float(ma_s.iloc[-1]), 2), round(float(ma_l.iloc[-1]), 2)
     if prev_diff > 0 and curr_diff <= 0:
-        return "SELL", round(float(ma5.iloc[-1]), 2), round(float(ma20.iloc[-1]), 2)
-    return "HOLD", round(float(ma5.iloc[-1]), 2), round(float(ma20.iloc[-1]), 2)
+        return "SELL", round(float(ma_s.iloc[-1]), 2), round(float(ma_l.iloc[-1]), 2)
+    return "HOLD", round(float(ma_s.iloc[-1]), 2), round(float(ma_l.iloc[-1]), 2)
 
 
 def run_trading():
@@ -172,12 +188,31 @@ def run_trading():
 
         current_price = float(prices.iloc[-1])
         signal, ma5, ma20 = calc_signal(prices)
+        rsi = calc_rsi(prices)
         shares_held, avg_price = get_position(conn, ticker)
 
-        print(f"  現在値: {current_price:.2f}  MA5: {ma5}  MA20: {ma20}  シグナル: {signal}")
+        print(f"  現在値: {current_price:.2f}  MA{MA_SHORT}: {ma5}  MA{MA_LONG}: {ma20}  RSI: {rsi}  シグナル: {signal}")
         print(f"  保有株数: {shares_held:.4f}  平均取得価格: {avg_price:.2f}")
 
+        # 保有中: 損切り・利確チェック（MAシグナルより優先）
+        if shares_held > 0:
+            change_pct = (current_price - avg_price) / avg_price
+            if change_pct <= -STOP_LOSS_RATIO:
+                reason = f"損切り {change_pct*100:+.1f}% (ライン: -{STOP_LOSS_RATIO*100:.0f}%)"
+                signal = "SELL"
+                print(f"  ★ {reason}")
+            elif change_pct >= TAKE_PROFIT_RATIO:
+                reason = f"利確 {change_pct*100:+.1f}% (ライン: +{TAKE_PROFIT_RATIO*100:.0f}%)"
+                signal = "SELL"
+                print(f"  ★ {reason}")
+            else:
+                reason = None
+
         if signal == "BUY" and shares_held == 0:
+            # RSIフィルター: 過熱域は見送り
+            if rsi is not None and rsi > RSI_BUY_MAX:
+                print(f"  → 見送り（RSI={rsi} > {RSI_BUY_MAX}、過熱域）")
+                continue
             budget = cash * MAX_POSITION_RATIO
             if budget < current_price:
                 print("  資金不足のためスキップ")
@@ -194,7 +229,7 @@ def run_trading():
             conn.execute(
                 "INSERT INTO trades (date,ticker,name,action,shares,price,total,fee,reason) VALUES (?,?,?,?,?,?,?,?,?)",
                 (today, ticker, name, "BUY", shares_to_buy, current_price, cost, round(fee, 2),
-                 f"ゴールデンクロス MA5={ma5} MA20={ma20}")
+                 f"ゴールデンクロス MA5={ma5} MA20={ma20} RSI={rsi}")
             )
             print(f"  → 買い注文: {shares_to_buy:.4f}株 @ {current_price:.2f} (合計: ¥{cost:,.0f}  手数料: ¥{fee:,.0f})")
 
@@ -205,10 +240,11 @@ def run_trading():
             cash    += proceeds - fee
             set_cash(conn, cash)
             set_position(conn, ticker, 0, 0)
+            sell_reason = reason if reason else f"デッドクロス MA5={ma5} MA20={ma20}"
             conn.execute(
                 "INSERT INTO trades (date,ticker,name,action,shares,price,total,fee,reason) VALUES (?,?,?,?,?,?,?,?,?)",
                 (today, ticker, name, "SELL", shares_held, current_price, proceeds, round(fee, 2),
-                 f"デッドクロス MA5={ma5} MA20={ma20} 損益: ¥{profit:,.0f}")
+                 f"{sell_reason} 損益: ¥{profit:,.0f}")
             )
             print(f"  → 売り注文: {shares_held:.4f}株 @ {current_price:.2f} (合計: ¥{proceeds:,.0f}  手数料: ¥{fee:,.0f}  損益: ¥{profit:,.0f})")
         else:
