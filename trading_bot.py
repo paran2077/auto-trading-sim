@@ -17,16 +17,38 @@ import os
 DB_PATH = os.path.join(os.path.dirname(__file__), "trading.db")
 
 STOCKS = {
-    "7203.T": "トヨタ",
-    "6758.T": "ソニー",
-    "7974.T": "任天堂",
-    "AAPL":   "Apple",
-    "NVDA":   "Nvidia",
-    "TSLA":   "Tesla",
+    "7203.T": ("トヨタ",  "JP"),
+    "6758.T": ("ソニー",  "JP"),
+    "7974.T": ("任天堂",  "JP"),
+    "AAPL":   ("Apple",  "US"),
+    "NVDA":   ("Nvidia", "US"),
+    "TSLA":   ("Tesla",  "US"),
 }
 
 INITIAL_CASH = 100_000  # 仮想元金（円）
 MAX_POSITION_RATIO = 0.2  # 1銘柄に使う資金の最大割合
+
+# 楽天証券 超割コース 日本株手数料テーブル（税込）
+_JP_FEE = [
+    (50_000,      55),
+    (100_000,     99),
+    (200_000,    115),
+    (500_000,    275),
+    (1_000_000,  535),
+    (1_500_000,  640),
+    (2_000_000, 1_013),
+]
+
+
+def calc_rakuten_fee(amount: float, market: str) -> float:
+    """楽天証券手数料（日本株: 超割コース、米国株: 0.495%）"""
+    if market == "JP":
+        for threshold, fee in _JP_FEE:
+            if amount <= threshold:
+                return float(fee)
+        return 1_070.0 + (amount - 2_000_000) * 0.00022
+    else:
+        return max(33.0, min(amount * 0.00495, 3_300.0))
 
 
 def init_db():
@@ -56,9 +78,15 @@ def init_db():
             shares REAL NOT NULL,
             price REAL NOT NULL,
             total REAL NOT NULL,
+            fee REAL DEFAULT 0,
             reason TEXT
         )
     """)
+    # 既存DBへの fee カラム追加（初回のみ）
+    try:
+        c.execute("ALTER TABLE trades ADD COLUMN fee REAL DEFAULT 0")
+    except Exception:
+        pass
     c.execute("""
         CREATE TABLE IF NOT EXISTS daily_summary (
             date TEXT PRIMARY KEY,
@@ -135,7 +163,7 @@ def run_trading():
     cash = get_cash(conn)
     print(f"現在の現金残高: ¥{cash:,.0f}")
 
-    for ticker, name in STOCKS.items():
+    for ticker, (name, market) in STOCKS.items():
         print(f"\n[{name} / {ticker}]")
         prices = get_price_history(ticker)
         if prices is None or len(prices) < 2:
@@ -156,28 +184,33 @@ def run_trading():
                 continue
             shares_to_buy = budget / current_price
             cost = shares_to_buy * current_price
-            cash -= cost
+            fee  = calc_rakuten_fee(cost, market)
+            if cash < cost + fee:
+                print("  手数料込みで資金不足のためスキップ")
+                continue
+            cash -= cost + fee
             set_cash(conn, cash)
             set_position(conn, ticker, shares_to_buy, current_price)
             conn.execute(
-                "INSERT INTO trades (date,ticker,name,action,shares,price,total,reason) VALUES (?,?,?,?,?,?,?,?)",
-                (today, ticker, name, "BUY", shares_to_buy, current_price, cost,
+                "INSERT INTO trades (date,ticker,name,action,shares,price,total,fee,reason) VALUES (?,?,?,?,?,?,?,?,?)",
+                (today, ticker, name, "BUY", shares_to_buy, current_price, cost, round(fee, 2),
                  f"ゴールデンクロス MA5={ma5} MA20={ma20}")
             )
-            print(f"  → 買い注文: {shares_to_buy:.4f}株 @ {current_price:.2f} (合計: ¥{cost:,.0f})")
+            print(f"  → 買い注文: {shares_to_buy:.4f}株 @ {current_price:.2f} (合計: ¥{cost:,.0f}  手数料: ¥{fee:,.0f})")
 
         elif signal == "SELL" and shares_held > 0:
             proceeds = shares_held * current_price
-            cash += proceeds
+            fee      = calc_rakuten_fee(proceeds, market)
+            profit   = proceeds - (shares_held * avg_price) - fee
+            cash    += proceeds - fee
             set_cash(conn, cash)
             set_position(conn, ticker, 0, 0)
-            profit = proceeds - (shares_held * avg_price)
             conn.execute(
-                "INSERT INTO trades (date,ticker,name,action,shares,price,total,reason) VALUES (?,?,?,?,?,?,?,?)",
-                (today, ticker, name, "SELL", shares_held, current_price, proceeds,
+                "INSERT INTO trades (date,ticker,name,action,shares,price,total,fee,reason) VALUES (?,?,?,?,?,?,?,?,?)",
+                (today, ticker, name, "SELL", shares_held, current_price, proceeds, round(fee, 2),
                  f"デッドクロス MA5={ma5} MA20={ma20} 損益: ¥{profit:,.0f}")
             )
-            print(f"  → 売り注文: {shares_held:.4f}株 @ {current_price:.2f} (合計: ¥{proceeds:,.0f}, 損益: ¥{profit:,.0f})")
+            print(f"  → 売り注文: {shares_held:.4f}株 @ {current_price:.2f} (合計: ¥{proceeds:,.0f}  手数料: ¥{fee:,.0f}  損益: ¥{profit:,.0f})")
         else:
             print("  → 様子見（ホールド）")
 
